@@ -1,8 +1,8 @@
 # pg_gftr
 
 An experimental PostgreSQL **18** extension implementing GPU sort-based
-grouped aggregation with GFTR (gather from transformed relations). PostgreSQL
-core does not need patches. Build targets include RTX A6000 (**sm_86**) and
+grouped aggregation with GFTR (gather from transformed relations) and batched
+GPU joins. PostgreSQL core does not need patches. Build targets include RTX A6000 (**sm_86**) and
 A100 (**sm_80**).
 
 This is the first aggregation milestone from *Efficiently Processing Joins and
@@ -26,7 +26,7 @@ reproduction of all their experiments.
   IDs and reads original payloads through the resulting map.
 - Explicit CPU reference backend for local correctness testing.
 
-GPU joins, hash/partitioned aggregation, dictionary encoding, multiple group
+Hash/partitioned aggregation, dictionary encoding, multiple group
 keys, expression group keys/aggregate arguments, `bigint`/numeric/text keys or
 payloads, global aggregation without GROUP BY, HAVING, FILTER, DISTINCT
 aggregates, ordered aggregates, grouping sets, window queries and partitionwise
@@ -121,6 +121,70 @@ configured preload library. No server restart is needed for session `LOAD`.
 Installing extension SQL objects alone does not load hooks into other sessions.
 `enabled` defaults to off. `force` defaults to off. There is no silent CPU
 fallback when a selected CUDA path fails.
+
+## Batched joins
+
+Join acceleration is opt-in. It handles read-only inner joins between ordinary
+tables on one built-in `integer` equality when PostgreSQL proves the build side
+unique. The join projects plain `integer` columns. PostgreSQL child plans apply
+base-table filters and supply rows under the query snapshot. NULL join keys
+never match. The backend selects a dense row-index table or a compact hash
+table based on the build key range and keeps it for the execution.
+
+```sql
+LOAD 'pg_gftr';
+SET pg_gftr.join_enabled = on;
+SET pg_gftr.join_backend = 'cuda';
+SET pg_gftr.join_force = on;  -- compare eligible plans in an experiment
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT s.s_nationkey, count(*), sum(l.l_linenumber)
+FROM lineitem l JOIN supplier s ON l.l_suppkey = s.s_suppkey
+GROUP BY s.s_nationkey;
+```
+
+Look for `Custom Scan (GftrJoin)`. Explicit `cpu` uses the same PostgreSQL
+operator and an in-memory CPU lookup. `join_force` changes planner preference
+for eligible queries. Planning costs are provisional. The operator has a
+bounded probe batch (`join_batch_rows`), a host budget (`join_max_host_mb`)
+and a device budget (`join_max_device_mb`). Budget failures raise an error.
+The current CUDA backend sends probe keys to the device and returns match
+indices for PostgreSQL to construct result tuples.
+
+Use `bench/join_benchmark.py` with loaded TPC-H tables to compare native
+PostgreSQL, native with increased `work_mem`, the compact CPU lookup and CUDA.
+It checks result digests and plan providers and saves complete JSON plans.
+See [JOIN_FINDINGS.md](JOIN_FINDINGS.md) for measured performance.
+
+## CPU fused join and aggregation
+
+An opt-in fused path combines a unique-build integer inner join with one
+integer group key from the build side, `COUNT(*)`, and optional
+`SUM(integer)` from the probe side. It emits group rows directly.
+
+```sql
+LOAD 'pg_gftr';
+SET pg_gftr.fused_enabled = on;
+SET pg_gftr.fused_parallel = on;
+SET max_parallel_workers_per_gather = 4;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT s.s_nationkey, count(*), sum(l.l_linenumber)
+FROM lineitem l JOIN supplier s ON l.l_suppkey = s.s_suppkey
+GROUP BY s.s_nationkey;
+```
+
+Look for `GftrFusedJoinAggregate`. The operator is CPU-based and uses
+`pg_gftr.join_max_host_mb` for its lookup and accumulation buffers.
+To offer the experimental parallel plan, set `pg_gftr.fused_parallel = on`
+with a positive `max_parallel_workers_per_gather`. On eligible plans, a
+parallel fact scan feeds worker-local fused aggregation, Gather receives
+partial group states and PostgreSQL finishes the aggregation. Each
+participant builds its own lookup within the configured memory budget.
+The serial fused plan is available when a parallel path cannot be built.
+
+See [FUSED_JOIN_FINDINGS.md](FUSED_JOIN_FINDINGS.md) for the workload,
+benchmarks and the effect of parallel workers.
 
 ## Planner and memory controls
 

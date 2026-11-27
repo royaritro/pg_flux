@@ -6,3 +6,5 @@ tests/backend_test
 tests/cuda_test
 __pycache__/
 results/
+tests/join_backend_test
+tests/join_backend_test_cuda

@@ -1,26 +1,4 @@
 /* PostgreSQL 18 custom upper path for single-int4-key aggregation. */
-/**
- * 1.1 
- * There are three reasons. Any one of them would be enough.
-
-**1. PostgreSQL only gives out one row at a time.**
-The executor works on pulling. Each node asks the node below it for the next row with `ExecProcNode(child)`, gets back one row, then asks again. There's no call that returns "all rows" or "a million rows". That's why `load_input` has a `for (;;)` loop that calls `ExecProcNode` until it gets NULL.
-
-**2. Sending rows to the GPU one by one would be very slow.**
-Every trip to the GPU has a fixed cost no matter how little you send: copying over PCIe and starting a kernel take roughly 5–20 microseconds each.
-- With 10 million rows sent one at a time, that's about 10M × 10 µs = **100 seconds of pure overhead**. The CPU could finish the whole aggregate in less time.
-- With all 10 million rows sent in one batch, you pay that overhead once. The GPU then works on every row in parallel across thousands of threads, which is the only reason it's faster.
-
-It's like a delivery truck: you don't drive a separate trip for each package. You load the truck and make one trip.
-
-**3. GROUP BY needs every row before any answer is final.**
-`SELECT region, sum(price) ... GROUP BY region` can't report the total for "east" until it has seen every row, because the very last row might also be "east". So the node has to collect all the rows first no matter what. The GPU just does that work for every group at once.
-
-**One more thing: PostgreSQL rows aren't laid out the way the GPU needs them.**
-Rows live inside 8 KB disk pages, with headers, padding and NULL bitmaps mixed in, and they're scattered across memory. The GPU wants plain, tightly packed arrays, like `keys[]` and `columns[c][]`. So while collecting, the node also repacks each row into those arrays. That packing step is the `pack_ms` timer in `GftrState`.
-
-So the order is: pull rows one by one, pack them into arrays, send them to the GPU in one copy, run the aggregation on all rows at once, and get the groups back. `capacity` and `max_rows` exist because of the packing step: the arrays have to keep growing while rows arrive, but only up to a limit.
- */
 #include "postgres.h"
 
 #include "access/htup_details.h"
@@ -46,6 +24,8 @@ So the order is: pull rows one by one, pack them into arrays, send them to the G
 #include "portability/instr_time.h"
 
 #include "gftr_backend.h"
+#include "gftr_join.h"
+#include "pg_gftr_fused.h"
 
 #if PG_VERSION_NUM < 180000 || PG_VERSION_NUM >= 190000
 #error "pg_gftr currently supports PostgreSQL 18 only"
@@ -121,40 +101,9 @@ typedef struct GftrState
 	 */
 	List *ops;
 	GftrInput input; // Go to it's .h
-	/**
-	 * PostgreSQL hands the GPU node rows one at a time, and the node has to store them all before it can send them to the GPU. More details in #1.1
-	 * At the start the node has no storage yet, so capacity = 0.
-	 * When the first row arrives it makes room for 8192 rows, so capacity = 8192.
-	 * When row 8193 arrives the space is full. It makes room for twice as many (16384), copies the old rows over, and keeps going. It doubles every time it fills up.
-	 * max_rows is the hard limit. It's worked out once from the setting pg_gftr.max_input_mb, which says how much memory you allow:
-	 * max_rows = allowed memory / bytes per row
-	 * For example, if pg_gftr.max_input_mb = 256, and each row is 16 bytes, then max_rows = 256 * 1024 * 1024 / 16 = 16777216.
-	 * 
-	 */
 	int capacity;
 	int max_rows;
 	GftrResult result;
-/*
- * Field        | Meaning
- * -------------+----------------------------------------------------------------
- * next_group   | Index of the next result group gftr_access will return.
- *              | Increments per call; when it reaches result.ngroups, the scan
- *              | is done. Reset to 0 in gftr_rescan.
- * loaded       | false until load_input has pulled every child row and run the
- *              | backend. Makes that work happen only once. Reset in gftr_rescan.
- * backend      | pg_gftr.backend: 0 = CUDA (GPU), 1 = CPU reference (checks the
- *              | GPU's answers).
- * mode         | pg_gftr.mode: 0 = GFTR (sort keys and carry the value columns
- *              | along), 1 = GFUR (sort (key, row-id), then read values[ids[i]]).
- * device       | pg_gftr.device: which CUDA GPU (0, 1, ...) to use.
- * device_bytes | pg_gftr.max_device_mb * 1 MiB: GPU memory budget for this node.
- *              | Exceeding it raises an error.
- * pack_ms      | Time to pull child rows and pack them into input arrays.
- *              | Shown as "Scan and Pack" in EXPLAIN ANALYZE.
- *
- * backend, mode, device and device_bytes are copied from the GUCs once at
- * BeginCustomScan, so a SET during the query doesn't affect it.
- */
 	int next_group;
 	bool loaded;
 	int backend;
@@ -163,37 +112,23 @@ typedef struct GftrState
 	size_t device_bytes;
 	double pack_ms;
 } GftrState;
-/*
- * GUC storage. Each variable holds the current value of pg_gftr.<name>.
- *
- * Variable           | GUC                  | Default | Meaning
- * -------------------+----------------------+---------+----------------------------------------
- * gftr_enabled       | pg_gftr.enabled      | off     | Master switch. If off, the planner hook
- *                    |                      |         | never offers a GPU path.
- * gftr_force         | pg_gftr.force        | off     | For experiments: ignore min_rows and set
- *                    |                      |         | the path's cost to ~0, so the planner
- *                    |                      |         | always picks it.
- * gftr_backend       | pg_gftr.backend      | 0       | 0 = CUDA (GPU), 1 = CPU reference
- *                    |                      |         | (checks the GPU's answers).
- * gftr_mode          | pg_gftr.mode         | 0       | 0 = GFTR (sort keys, carry the value
- *                    |                      |         | columns along), 1 = GFUR (sort (key,
- *                    |                      |         | row-id), then read values[ids[i]]).
- * gftr_device        | pg_gftr.device       | 0       | Which CUDA GPU to use.
- * gftr_min_rows      | pg_gftr.min_rows     | 100000  | Skip the GPU if the planner estimates
- *                    |                      |         | fewer input rows (unless force is on).
- *                    |                      |         | Small inputs aren't worth the overhead.
- * gftr_max_input_mb  | pg_gftr.max_input_mb | 256     | CPU memory budget for the packed input
- *                    |                      |         | arrays. Sets GftrState.max_rows.
- * gftr_max_device_mb | pg_gftr.max_device_mb| 4096    | GPU memory budget for this node.
- *                    |                      |         | Sets GftrState.device_bytes.
- * gftr_setup_cost    | pg_gftr.setup_cost   | 1000.0  | Fixed planner cost per GPU run (context,
- *                    |                      |         | allocation, kernel launches).
- * gftr_tuple_cost    | pg_gftr.tuple_cost   | 0.02    | Planner cost per input row (pack +
- *                    |                      |         | transfer + compute).
- *
- * Path cost = child_total_cost + setup_cost + child_rows * tuple_cost.
- * The planner compares that against native HashAgg/GroupAgg and picks the cheaper one.
- */
+
+typedef struct GftrFusedAggregateState
+{
+	CustomScanState css;
+	CustomScanState *join;
+	MemoryContext result_context;
+	List *ops;
+	AttrNumber group_attno;
+	AttrNumber sum_attno;
+	bool loaded;
+	int next_group;
+	GftrFusedResult result;
+} GftrFusedAggregateState;
+
+static bool fused_enabled = false;
+static bool fused_force = false;
+static bool fused_parallel = false;
 static bool gftr_enabled = false;
 static bool gftr_force = false;
 static int gftr_backend = 0;
@@ -224,6 +159,13 @@ static void gftr_end(CustomScanState *);
 static void gftr_rescan(CustomScanState *);
 static void gftr_explain(CustomScanState *, List *, ExplainState *);
 
+static Node *fused_create_state(CustomScan *);
+static void fused_begin(CustomScanState *, EState *, int);
+static TupleTableSlot *fused_exec(CustomScanState *);
+static void fused_end(CustomScanState *);
+static void fused_rescan(CustomScanState *);
+static void fused_explain(CustomScanState *, List *, ExplainState *);
+
 static const CustomPathMethods path_methods = {
 	.CustomName = "GftrAggregate",
 	.PlanCustomPath = gftr_plan_path
@@ -241,6 +183,23 @@ static const CustomExecMethods exec_methods = {
 	.ExplainCustomScan = gftr_explain
 };
 
+static const CustomPathMethods fused_path_methods = {
+	.CustomName = "GftrFusedJoinAggregate",
+	.PlanCustomPath = gftr_plan_path
+};
+static const CustomScanMethods fused_scan_methods = {
+	.CustomName = "GftrFusedJoinAggregate",
+	.CreateCustomScanState = fused_create_state
+};
+static const CustomExecMethods fused_exec_methods = {
+	.CustomName = "GftrFusedJoinAggregate",
+	.BeginCustomScan = fused_begin,
+	.ExecCustomScan = fused_exec,
+	.EndCustomScan = fused_end,
+	.ReScanCustomScan = fused_rescan,
+	.ExplainCustomScan = fused_explain
+};
+
 Datum
 pg_gftr_version(PG_FUNCTION_ARGS)
 {
@@ -254,6 +213,12 @@ pg_gftr_version(PG_FUNCTION_ARGS)
 void
 _PG_init(void)
 {
+	DefineCustomBoolVariable("pg_gftr.fused_enabled", "Offer CPU fused join and grouped aggregate paths.",
+		NULL, &fused_enabled, false, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_gftr.fused_force", "Prefer supported fused paths for experiments.",
+		NULL, &fused_force, false, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_gftr.fused_parallel", "Offer worker-local fused aggregation.",
+		NULL, &fused_parallel, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("pg_gftr.enabled", "Offer GPU aggregate paths.",
 		NULL, &gftr_enabled, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("pg_gftr.force", "Prefer supported custom paths for experiments.",
@@ -274,8 +239,10 @@ _PG_init(void)
 		NULL, &gftr_setup_cost, 1000.0, 0.0, 1e12, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("pg_gftr.tuple_cost", "Estimated packing, transfer and compute cost per row.",
 		NULL, &gftr_tuple_cost, 0.02, 0.0, 1e6, PGC_USERSET, 0, NULL, NULL, NULL);
+	gftr_join_init();
 	MarkGUCPrefixReserved("pg_gftr");
 	RegisterCustomScanMethods(&scan_methods);
+	RegisterCustomScanMethods(&fused_scan_methods);
 	previous_upper_hook = create_upper_paths_hook;
 	create_upper_paths_hook = gftr_upper_paths;
 }
@@ -283,16 +250,17 @@ _PG_init(void)
 void
 _PG_fini(void)
 {
+	gftr_join_fini();
 	if (create_upper_paths_hook == gftr_upper_paths)
 		create_upper_paths_hook = previous_upper_hook;
 }
 
 /* Match built-in aggregate OIDs, never names that a search_path can shadow. */
 static int
-aggregate_op(Aggref *agg)
+aggregate_op(Aggref *agg, AggSplit split)
 {
 	TargetEntry *arg;
-	if (agg->agglevelsup != 0 || agg->aggsplit != AGGSPLIT_SIMPLE ||
+	if (agg->agglevelsup != 0 || agg->aggsplit != split ||
 		agg->aggkind != AGGKIND_NORMAL || agg->aggdistinct || agg->aggorder ||
 		agg->aggfilter || agg->aggdirectargs || agg->aggvariadic)
 		return 0;
@@ -315,6 +283,117 @@ aggregate_op(Aggref *agg)
 	}
 }
 
+/*
+ * The fused reducer consumes the join's packed inputs directly. Resolve
+ * attributes against the bare join, even when GROUP BY planning previously
+ * wrapped it in a projection path to assign sort/group references.
+ */
+static Path *
+fused_join_child(Path *path, Var *group, Var *sum)
+{
+	CustomPath *join;
+	Path *probe;
+	Path *build;
+
+	while (IsA(path, ProjectionPath))
+		path = ((ProjectionPath *) path)->subpath;
+	if (!IsA(path, CustomPath) || path->param_info)
+		return NULL;
+	join = (CustomPath *) path;
+	if (strcmp(join->methods->CustomName, "GftrJoin") != 0 ||
+		list_length(join->custom_paths) != 2)
+		return NULL;
+	probe = linitial(join->custom_paths);
+	build = lsecond(join->custom_paths);
+	if (!bms_is_member(group->varno, build->parent->relids) ||
+		!list_member(path->pathtarget->exprs, group) ||
+		(sum && (!bms_is_member(sum->varno, probe->parent->relids) ||
+				 !list_member(path->pathtarget->exprs, sum))))
+		return NULL;
+	return path;
+}
+
+static void
+add_fused_path(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
+			   GroupPathExtraData *extra, List *scan_tlist)
+{
+	Var *group = (Var *) linitial_node(TargetEntry, scan_tlist)->expr;
+	Var *sum = NULL;
+	bool count = false;
+	Path *best = NULL;
+	CustomPath *path;
+	ListCell *lc;
+
+	if (group->varattno <= 0 || !bms_is_empty(group->varnullingrels))
+		return;
+	for_each_from(lc, scan_tlist, 1)
+	{
+		Aggref *agg = (Aggref *) lfirst_node(TargetEntry, lc)->expr;
+		int op = aggregate_op(agg, AGGSPLIT_SIMPLE);
+
+		if (op == GFTR_COUNT_STAR)
+			count = true;
+		else if (op == GFTR_SUM && !sum)
+			sum = (Var *) linitial_node(TargetEntry, agg->args)->expr;
+		else
+			return;
+	}
+	if (!count || (sum && (sum->varattno <= 0 || !bms_is_empty(sum->varnullingrels))))
+		return;
+
+	foreach(lc, input_rel->pathlist)
+	{
+		Path *candidate = fused_join_child(lfirst(lc), group, sum);
+
+		if (candidate && (!best || compare_path_costs(candidate, best, TOTAL_COST) < 0))
+			best = candidate;
+	}
+	/*
+	 * Fusion is independent of the plain join GUCs. If there is no
+	 * suitable custom candidate, use a private child derived from a
+	 * native path without adding that child to the join relation.
+	 */
+	if (!best)
+	{
+		foreach(lc, input_rel->pathlist)
+		{
+			Path *candidate = pg_gftr_fused_join_path(root, lfirst(lc));
+
+			if (candidate)
+				candidate = fused_join_child(candidate, group, sum);
+			if (candidate && (!best || compare_path_costs(candidate, best, TOTAL_COST) < 0))
+				best = candidate;
+		}
+	}
+	if (!best || (!fused_force && best->rows < gftr_min_rows))
+		return;
+	if (fused_parallel &&
+		pg_gftr_add_parallel_fused_path(root, output_rel, extra, best, scan_tlist,
+										&fused_path_methods, fused_force) &&
+		fused_force)
+		return;
+
+	path = makeNode(CustomPath);
+	path->path.pathtype = T_CustomScan;
+	path->path.parent = output_rel;
+	path->path.pathtarget = output_rel->reltarget;
+	path->path.rows = ((Path *) linitial(output_rel->pathlist))->rows;
+	path->path.disabled_nodes = best->disabled_nodes;
+	/* The fused executor consumes all probe rows before producing any group. */
+	path->path.startup_cost = best->total_cost + cpu_operator_cost * best->rows;
+	path->path.total_cost = path->path.startup_cost + cpu_tuple_cost * path->path.rows;
+	if (fused_force)
+	{
+		path->path.disabled_nodes = 0;
+		path->path.startup_cost = 0;
+		path->path.total_cost = 0.0001;
+	}
+	path->custom_paths = list_make1(best);
+	path->custom_private = scan_tlist;
+	path->methods = &fused_path_methods;
+	add_path(output_rel, &path->path);
+}
+
 static void
 gftr_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 				 RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra)
@@ -331,39 +410,27 @@ gftr_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 
 	if (previous_upper_hook)
 		previous_upper_hook(root, stage, input_rel, output_rel, extra);
-	if (!gftr_enabled || stage != UPPERREL_GROUP_AGG ||
+	if ((!gftr_enabled && !fused_enabled) || stage != UPPERREL_GROUP_AGG ||
 		!root->parse->hasAggs || list_length(root->parse->groupClause) != 1 ||
 		root->parse->groupingSets || root->parse->hasTargetSRFs ||
 		root->parse->hasWindowFuncs || group_extra->havingQual ||
-		group_extra->patype != PARTITIONWISE_AGGREGATE_NONE)
+		group_extra->patype != PARTITIONWISE_AGGREGATE_NONE ||
+		output_rel->pathlist == NIL)
 		return;
 	clause = linitial_node(SortGroupClause, root->parse->groupClause);
 	key = get_sortgroupclause_expr(clause, root->parse->targetList);
 	if (!IsA(key, Var) || exprType(key) != INT4OID ||
 		((Var *) key)->varlevelsup != 0 || clause->eqop != Int4EqualOperator)
 		return;
-	child = input_rel->cheapest_total_path;
-	if (!child || child->param_info ||
-		(!gftr_force && child->rows < gftr_min_rows) ||
-		!list_member(child->pathtarget->exprs, key))
-		return;
 	scan_tlist = lappend(scan_tlist,
 		makeTargetEntry((Expr *) copyObject(key), resno++, NULL, false));
 	foreach(lc, output_rel->reltarget->exprs)
 	{
 		Node *expr = lfirst(lc);
-		Aggref *agg;
 		if (equal(expr, key))
 			continue;
-		if (!IsA(expr, Aggref) || !aggregate_op((Aggref *) expr))
+		if (!IsA(expr, Aggref) || !aggregate_op((Aggref *) expr, AGGSPLIT_SIMPLE))
 			return;
-		agg = (Aggref *) expr;
-		if (agg->args != NIL)
-		{
-			TargetEntry *arg = linitial_node(TargetEntry, agg->args);
-			if (!list_member(child->pathtarget->exprs, arg->expr))
-				return;
-		}
 		if (!tlist_member((Expr *) expr, scan_tlist))
 			scan_tlist = lappend(scan_tlist,
 				makeTargetEntry((Expr *) copyObject(expr), resno++, NULL, false));
@@ -371,6 +438,25 @@ gftr_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	}
 	if (!has_aggregate)
 		return;
+	if (fused_enabled)
+		add_fused_path(root, input_rel, output_rel, group_extra, scan_tlist);
+	if (!gftr_enabled)
+		return;
+
+	child = input_rel->cheapest_total_path;
+	if (!child || child->param_info ||
+		(!gftr_force && child->rows < gftr_min_rows) ||
+		!list_member(child->pathtarget->exprs, key))
+		return;
+	for_each_from(lc, scan_tlist, 1)
+	{
+		Aggref *agg = (Aggref *) lfirst_node(TargetEntry, lc)->expr;
+
+		if (agg->args != NIL &&
+			!list_member(child->pathtarget->exprs,
+						 linitial_node(TargetEntry, agg->args)->expr))
+			return;
+	}
 	path = makeNode(CustomPath);
 	path->path.pathtype = T_CustomScan;
 	path->path.parent = output_rel;
@@ -405,24 +491,36 @@ gftr_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 	CustomScan *scan = makeNode(CustomScan);
 	Plan *child = (Plan *) linitial(children);
 	List *scan_tlist = path->custom_private;
+	bool fused = path->methods == &fused_path_methods;
+	AggSplit split = fused && path->path.parallel_workers > 0 ?
+		AGGSPLIT_INITIAL_SERIAL : AGGSPLIT_SIMPLE;
+	List *source_tlist = child->targetlist;
 	TargetEntry *key_entry;
 	List *attrs = NIL;
 	List *ops = NIL;
 	ListCell *lc;
 
+	if (fused)
+	{
+		CustomScan *join = castNode(CustomScan, child);
+
+		source_tlist = join->custom_scan_tlist;
+	}
 	key_entry = tlist_member(linitial_node(TargetEntry, scan_tlist)->expr,
-							 child->targetlist);
+							 source_tlist);
 	if (!key_entry)
 		elog(ERROR, "pg_gftr: grouping key missing from child target list");
 	for_each_from(lc, scan_tlist, 1)
 	{
 		Aggref *agg = (Aggref *) lfirst_node(TargetEntry, lc)->expr;
-		int op = aggregate_op(agg);
+		int op = aggregate_op(agg, split);
 		int col = -1;
+		if (!op)
+			elog(ERROR, "pg_gftr: unsupported aggregate in custom plan");
 		if (op != GFTR_COUNT_STAR)
 		{
 			TargetEntry *arg = linitial_node(TargetEntry, agg->args);
-			TargetEntry *entry = tlist_member(arg->expr, child->targetlist);
+			TargetEntry *entry = tlist_member(arg->expr, source_tlist);
 			ListCell *ac;
 			if (!entry)
 				elog(ERROR, "pg_gftr: aggregate input missing from child target list");
@@ -443,7 +541,7 @@ gftr_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 	scan->custom_scan_tlist = copyObject(scan_tlist);
 	scan->custom_plans = children;
 	scan->custom_private = list_make3(makeInteger(key_entry->resno), attrs, ops);
-	scan->methods = &scan_methods;
+	scan->methods = fused ? &fused_scan_methods : &scan_methods;
 	return &scan->scan.plan;
 }
 
@@ -678,5 +776,124 @@ gftr_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		ExplainPropertyFloat("Sort", "ms", state->result.sort_ms, 3, es);
 		ExplainPropertyFloat("Group and Reduce", "ms", state->result.reduce_ms, 3, es);
 		ExplainPropertyFloat("Transfer", "ms", state->result.transfer_ms, 3, es);
+	}
+}
+
+static Node *
+fused_create_state(CustomScan *scan)
+{
+	GftrFusedAggregateState *state = palloc0(sizeof(*state));
+
+	NodeSetTag(&state->css, T_CustomScanState);
+	state->css.methods = &fused_exec_methods;
+	return (Node *) state;
+}
+
+static void
+fused_begin(CustomScanState *node, EState *estate, int eflags)
+{
+	GftrFusedAggregateState *state = (GftrFusedAggregateState *) node;
+	CustomScan *plan = (CustomScan *) node->ss.ps.plan;
+	List *attrs = lsecond(plan->custom_private);
+	PlanState *child;
+
+	state->group_attno = intVal(linitial(plan->custom_private));
+	state->sum_attno = attrs == NIL ? 0 : linitial_int(attrs);
+	state->ops = lthird(plan->custom_private);
+	state->result_context = AllocSetContextCreate(estate->es_query_cxt,
+		"GftrFusedJoinAggregate results", ALLOCSET_SMALL_SIZES);
+	child = ExecInitNode((Plan *) linitial(plan->custom_plans), estate, eflags);
+	if (!IsA(child, CustomScanState))
+		elog(ERROR, "pg_gftr fused aggregate requires a custom join child");
+	state->join = (CustomScanState *) child;
+	pg_gftr_fused_prepare_join(state->join);
+	node->custom_ps = list_make1(child);
+}
+
+static TupleTableSlot *
+fused_access(ScanState *scan)
+{
+	GftrFusedAggregateState *state = (GftrFusedAggregateState *) scan;
+	TupleTableSlot *slot = scan->ss_ScanTupleSlot;
+	GftrFusedGroup *group;
+	int out = 1;
+	ListCell *lc;
+
+	if (!state->loaded)
+	{
+		if (state->join->ss.ps.chgParam)
+			ExecReScan(&state->join->ss.ps);
+		pg_gftr_fused_reduce(state->join, state->group_attno, state->sum_attno,
+							state->result_context, &state->result);
+		state->loaded = true;
+	}
+	ExecClearTuple(slot);
+	if (state->next_group >= state->result.ngroups)
+		return slot;
+
+	group = &state->result.groups[state->next_group++];
+	slot->tts_isnull[0] = group->key_null;
+	slot->tts_values[0] = Int32GetDatum(group->key);
+	foreach(lc, state->ops)
+	{
+		int op = linitial_int(lfirst(lc));
+		bool is_count = op == GFTR_COUNT_STAR;
+
+		slot->tts_isnull[out] = !is_count && !group->sum_valid;
+		slot->tts_values[out] = Int64GetDatum(is_count ? group->count : group->sum);
+		out++;
+	}
+	return ExecStoreVirtualTuple(slot);
+}
+
+static TupleTableSlot *
+fused_exec(CustomScanState *node)
+{
+	return ExecScan(&node->ss, fused_access, gftr_recheck);
+}
+
+static void
+fused_end(CustomScanState *node)
+{
+	GftrFusedAggregateState *state = (GftrFusedAggregateState *) node;
+
+	ExecEndNode(&state->join->ss.ps);
+	MemoryContextDelete(state->result_context);
+}
+
+static void
+fused_rescan(CustomScanState *node)
+{
+	GftrFusedAggregateState *state = (GftrFusedAggregateState *) node;
+	PlanState *child = &state->join->ss.ps;
+
+	ExecScanReScan(&node->ss);
+	MemoryContextReset(state->result_context);
+	memset(&state->result, 0, sizeof(state->result));
+	state->loaded = false;
+	state->next_group = 0;
+	if (node->ss.ps.chgParam)
+		UpdateChangedParamSet(child, node->ss.ps.chgParam);
+	if (!child->chgParam)
+		ExecReScan(child);
+}
+
+static void
+fused_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	GftrFusedAggregateState *state = (GftrFusedAggregateState *) node;
+
+	ExplainPropertyText("Backend", "CPU", es);
+	ExplainPropertyText("Algorithm", "Fused unique join and grouped reduction", es);
+	ExplainPropertyBool("Partial", node->ss.ps.plan->parallel_safe, es);
+	if (es->analyze && state->loaded)
+	{
+		if (node->ss.ps.plan->parallel_safe)
+			ExplainPropertyText("Counter Scope", "Local participant", es);
+		ExplainPropertyUInteger("Probe Rows", NULL, state->result.probe_rows, es);
+		ExplainPropertyUInteger("Matched Rows", NULL, state->result.match_rows, es);
+		ExplainPropertyInteger("Groups", NULL, state->result.ngroups, es);
+		ExplainPropertyFloat("Build", "ms", state->result.build_ms, 3, es);
+		ExplainPropertyFloat("Probe and Reduce", "ms", state->result.probe_ms, 3, es);
 	}
 }
