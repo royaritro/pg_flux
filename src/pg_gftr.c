@@ -1,4 +1,26 @@
 /* PostgreSQL 18 custom upper path for single-int4-key aggregation. */
+/**
+ * #1.1 
+ * There are three reasons. Any one of them would be enough.
+
+**1. PostgreSQL only gives out one row at a time.**
+The executor works on pulling. Each node asks the node below it for the next row with `ExecProcNode(child)`, gets back one row, then asks again. There's no call that returns "all rows" or "a million rows". That's why `load_input` has a `for (;;)` loop that calls `ExecProcNode` until it gets NULL.
+
+**2. Sending rows to the GPU one by one would be very slow.**
+Every trip to the GPU has a fixed cost no matter how little you send: copying over PCIe and starting a kernel take roughly 5–20 microseconds each.
+- With 10 million rows sent one at a time, that's about 10M × 10 µs = **100 seconds of pure overhead**. The CPU could finish the whole aggregate in less time.
+- With all 10 million rows sent in one batch, you pay that overhead once. The GPU then works on every row in parallel across thousands of threads, which is the only reason it's faster.
+
+It's like a delivery truck: you don't drive a separate trip for each package. You load the truck and make one trip.
+
+**3. GROUP BY needs every row before any answer is final.**
+`SELECT region, sum(price) ... GROUP BY region` can't report the total for "east" until it has seen every row, because the very last row might also be "east". So the node has to collect all the rows first no matter what. The GPU just does that work for every group at once.
+
+**One more thing: PostgreSQL rows aren't laid out the way the GPU needs them.**
+Rows live inside 8 KB disk pages, with headers, padding and NULL bitmaps mixed in, and they're scattered across memory. The GPU wants plain, tightly packed arrays, like `keys[]` and `columns[c][]`. So while collecting, the node also repacks each row into those arrays. That packing step is the `pack_ms` timer in `GftrState`.
+
+So the order is: pull rows one by one, pack them into arrays, send them to the GPU in one copy, run the aggregation on all rows at once, and get the groups back. `capacity` and `max_rows` exist because of the packing step: the arrays have to keep growing while rows arrive, but only up to a limit.
+ */
 #include "postgres.h"
 
 #include "access/htup_details.h"
@@ -99,6 +121,16 @@ typedef struct GftrState
 	 */
 	List *ops;
 	GftrInput input; // Go to it's .h
+	/**
+	 * PostgreSQL hands the GPU node rows one at a time, and the node has to store them all before it can send them to the GPU. More details in #1.1
+	 * At the start the node has no storage yet, so capacity = 0.
+	 * When the first row arrives it makes room for 8192 rows, so capacity = 8192.
+	 * When row 8193 arrives the space is full. It makes room for twice as many (16384), copies the old rows over, and keeps going. It doubles every time it fills up.
+	 * max_rows is the hard limit. It's worked out once from the setting pg_gftr.max_input_mb, which says how much memory you allow:
+	 * max_rows = allowed memory / bytes per row
+	 * For example, if pg_gftr.max_input_mb = 256, and each row is 16 bytes, then max_rows = 256 * 1024 * 1024 / 16 = 16777216.
+	 * 
+	 */
 	int capacity;
 	int max_rows;
 	GftrResult result;

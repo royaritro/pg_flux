@@ -72,6 +72,12 @@ typedef struct GftrInput
 	GftrValue **columns; // columns[col][row]: value for each row in each column
 } GftrInput;
 
+/**
+ * GftrResult is the answer the GPU (or the CPU reference) sends back : one entry per group, plus timing numbers for EXPLAIN ANALYZE.
+
+Using the same example: SELECT region, count(*), sum(price), max(qty) ... GROUP BY region.
+
+ */
 typedef struct GftrResult
 {
 	int32_t ngroups;
