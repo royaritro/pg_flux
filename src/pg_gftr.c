@@ -1,6 +1,6 @@
 /* PostgreSQL 18 custom upper path for single-int4-key aggregation. */
 /**
- * #1.1 
+ * 1.1 
  * There are three reasons. Any one of them would be enough.
 
 **1. PostgreSQL only gives out one row at a time.**
@@ -134,6 +134,27 @@ typedef struct GftrState
 	int capacity;
 	int max_rows;
 	GftrResult result;
+/*
+ * Field        | Meaning
+ * -------------+----------------------------------------------------------------
+ * next_group   | Index of the next result group gftr_access will return.
+ *              | Increments per call; when it reaches result.ngroups, the scan
+ *              | is done. Reset to 0 in gftr_rescan.
+ * loaded       | false until load_input has pulled every child row and run the
+ *              | backend. Makes that work happen only once. Reset in gftr_rescan.
+ * backend      | pg_gftr.backend: 0 = CUDA (GPU), 1 = CPU reference (checks the
+ *              | GPU's answers).
+ * mode         | pg_gftr.mode: 0 = GFTR (sort keys and carry the value columns
+ *              | along), 1 = GFUR (sort (key, row-id), then read values[ids[i]]).
+ * device       | pg_gftr.device: which CUDA GPU (0, 1, ...) to use.
+ * device_bytes | pg_gftr.max_device_mb * 1 MiB: GPU memory budget for this node.
+ *              | Exceeding it raises an error.
+ * pack_ms      | Time to pull child rows and pack them into input arrays.
+ *              | Shown as "Scan and Pack" in EXPLAIN ANALYZE.
+ *
+ * backend, mode, device and device_bytes are copied from the GUCs once at
+ * BeginCustomScan, so a SET during the query doesn't affect it.
+ */
 	int next_group;
 	bool loaded;
 	int backend;
@@ -142,7 +163,37 @@ typedef struct GftrState
 	size_t device_bytes;
 	double pack_ms;
 } GftrState;
-
+/*
+ * GUC storage. Each variable holds the current value of pg_gftr.<name>.
+ *
+ * Variable           | GUC                  | Default | Meaning
+ * -------------------+----------------------+---------+----------------------------------------
+ * gftr_enabled       | pg_gftr.enabled      | off     | Master switch. If off, the planner hook
+ *                    |                      |         | never offers a GPU path.
+ * gftr_force         | pg_gftr.force        | off     | For experiments: ignore min_rows and set
+ *                    |                      |         | the path's cost to ~0, so the planner
+ *                    |                      |         | always picks it.
+ * gftr_backend       | pg_gftr.backend      | 0       | 0 = CUDA (GPU), 1 = CPU reference
+ *                    |                      |         | (checks the GPU's answers).
+ * gftr_mode          | pg_gftr.mode         | 0       | 0 = GFTR (sort keys, carry the value
+ *                    |                      |         | columns along), 1 = GFUR (sort (key,
+ *                    |                      |         | row-id), then read values[ids[i]]).
+ * gftr_device        | pg_gftr.device       | 0       | Which CUDA GPU to use.
+ * gftr_min_rows      | pg_gftr.min_rows     | 100000  | Skip the GPU if the planner estimates
+ *                    |                      |         | fewer input rows (unless force is on).
+ *                    |                      |         | Small inputs aren't worth the overhead.
+ * gftr_max_input_mb  | pg_gftr.max_input_mb | 256     | CPU memory budget for the packed input
+ *                    |                      |         | arrays. Sets GftrState.max_rows.
+ * gftr_max_device_mb | pg_gftr.max_device_mb| 4096    | GPU memory budget for this node.
+ *                    |                      |         | Sets GftrState.device_bytes.
+ * gftr_setup_cost    | pg_gftr.setup_cost   | 1000.0  | Fixed planner cost per GPU run (context,
+ *                    |                      |         | allocation, kernel launches).
+ * gftr_tuple_cost    | pg_gftr.tuple_cost   | 0.02    | Planner cost per input row (pack +
+ *                    |                      |         | transfer + compute).
+ *
+ * Path cost = child_total_cost + setup_cost + child_rows * tuple_cost.
+ * The planner compares that against native HashAgg/GroupAgg and picks the cheaper one.
+ */
 static bool gftr_enabled = false;
 static bool gftr_force = false;
 static int gftr_backend = 0;
